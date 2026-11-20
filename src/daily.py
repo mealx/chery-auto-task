@@ -212,21 +212,105 @@ def do_share(token, times=2):
     return ok > 0, "分享成功%d/%d次" % (ok, times)
 
 
+class OssPolicyError(RuntimeError):
+    """policy 条件不匹配：重试无意义，直接把条件打出来。"""
+
+
+_OSS_POLICY_SHOWN = False
+
+
+def _b64_decode(s):
+    """policy 可能是 urlsafe / 去掉 padding 的 base64，统一还原。"""
+    s = str(s).replace("-", "+").replace("_", "/")
+    return base64.b64decode(s + "=" * (-len(s) % 4))
+
+
+def decode_policy(policy_b64):
+    return json.loads(_b64_decode(policy_b64).decode("utf-8"))
+
+
+def policy_plan(policy_b64):
+    """把服务端 policy 的 conditions 翻译成本次上传必须满足的硬约束。
+
+    返回 (policy_dict, plan)，plan 含:
+      key_prefix / key_eq : key 必须满足的前缀或定值（直接取自 policy，不再硬编码 uid）
+      content_type        : policy 要求的 Content-Type 表单域
+      min_len / max_len   : content-length-range
+      extra               : 其它 eq 条件（success_action_status / x-oss-object-acl ...）
+    """
+    pol = decode_policy(policy_b64)
+    plan = {"key_prefix": None, "key_eq": None, "content_type": None,
+            "min_len": 0, "max_len": None, "extra": {}}
+    for c in pol.get("conditions") or []:
+        if not isinstance(c, list) or not c:
+            continue
+        op = c[0]
+        if op == "content-length-range" and len(c) >= 3:
+            plan["min_len"], plan["max_len"] = int(c[1]), int(c[2])
+            continue
+        if op in ("starts-with", "eq") and len(c) >= 3:
+            field = str(c[1]).lstrip("$")
+            val = c[2]
+            low = field.lower()
+            if low == "key":
+                plan["key_eq" if op == "eq" else "key_prefix"] = val
+            elif low == "content-type":
+                plan["content_type"] = val
+            elif op == "eq":
+                plan["extra"][field] = val
+    return pol, plan
+
+
+def _upload_key(plan, sts, idx, suffix):
+    """按 policy 允许的前缀生成对象名；服务端给了 dir 就用 dir。"""
+    base = "%d_%d.%s" % (int(time.time() * 1000), idx, suffix)
+    if plan["key_eq"]:
+        return plan["key_eq"]
+    prefix = plan["key_prefix"] or (sts.get("dir") or "").rstrip("/") or None
+    if prefix:
+        return (prefix if prefix.endswith("/") else prefix + "/") + base
+    return "chery-prod/mobile/community/%s/%s" % (MY_ACCOUNT_ID, base)
+
+
 def oss_upload(token, mp4_bytes, suffix="mp4", tries=5):
+    """STS 签名 → OSS PostObject。表单字段全部从 policy 反推，不再靠猜。"""
+    global _OSS_POLICY_SHOWN
     import time as _t
     import http.client as _hc
     last = None
-    for i in range(tries):  # STS 签名有时效，失败就取新签名重试
+    size = len(mp4_bytes)
+    for i in range(tries):  # STS 有时效，失败就取新签名重试
         try:
             sts = enc_get("/web/community/common/sts/signature",
                           token)["data"]
-            fname = "chery-prod/mobile/community/6000000001112452/%d_%d.%s" % (
-                int(_t.time() * 1000), i, suffix)
+            pol, plan = policy_plan(sts["policy"])
+            if not _OSS_POLICY_SHOWN:
+                _OSS_POLICY_SHOWN = True
+                log("OSS policy conditions: %s" % json.dumps(
+                    pol.get("conditions"), ensure_ascii=False))
+                log("OSS 约束: key_prefix=%r content_type=%r 大小=%s..%s"
+                    % (plan["key_prefix"] or plan["key_eq"],
+                       plan["content_type"], plan["min_len"],
+                       plan["max_len"]))
+            if plan["max_len"] and size > plan["max_len"]:
+                raise OssPolicyError(
+                    "视频 %d 字节超过 policy 上限 %d 字节，压缩/截短后再传"
+                    % (size, plan["max_len"]))
+            fname = _upload_key(plan, sts, i, suffix)
+            ctype = plan["content_type"] or "video/mp4"
             boundary = "----CheryB%s" % secrets.token_hex(4)
             fields = {"key": fname, "policy": sts["policy"],
                       "OSSAccessKeyId": sts["accessId"],
-                      "signature": sts["signature"],
-                      "success_action_status": "200"}
+                      "signature": sts["signature"]}
+            # policy 里既有 eq $Content-Type 条件时，表单必须真的带这个字段，
+            # 只写在 file part 的 header 里 OSS 不认（这正是一次 Policy Condition fail 的常见原因）
+            fields["Content-Type"] = ctype
+            for k, v in plan["extra"].items():
+                if k.lower() != "bucket":
+                    fields.setdefault(k, v)
+            tok = sts.get("securityToken") or sts.get("securitytoken")
+            if tok:
+                fields["x-oss-security-token"] = tok
             parts = []
             for k, v in fields.items():
                 parts.append(
@@ -234,8 +318,8 @@ def oss_upload(token, mp4_bytes, suffix="mp4", tries=5):
                      % (boundary, k, v)).encode())
             parts.append(
                 ("--%s\r\nContent-Disposition: form-data; name=\"file\"; "
-                 "filename=\"v.%s\"\r\nContent-Type: video/mp4\r\n\r\n"
-                 % (boundary, suffix)).encode() + mp4_bytes)
+                 "filename=\"v.%s\"\r\nContent-Type: %s\r\n\r\n"
+                 % (boundary, suffix, ctype)).encode() + mp4_bytes)
             # multipart 规范: 最后 boundary 前必须 CRLF(OSS 严格,缺了报 Malformed)
             parts.append(("\r\n--%s--\r\n" % boundary).encode())
             body = b"".join(parts)
@@ -250,7 +334,17 @@ def oss_upload(token, mp4_bytes, suffix="mp4", tries=5):
             conn.close()
             if r.status == 200:
                 return "https://img.chery.cn/" + fname
-            raise RuntimeError("OSS %s: %s" % (r.status, rb[:200]))
+            text = rb.decode("utf-8", "replace")
+            # 400/403 里的条件类错误是确定性的，重试只会白等 45 秒
+            if r.status == 403 or "Policy Condition" in text:
+                raise OssPolicyError(
+                    "OSS %s (key=%s size=%d)\n%s"
+                    % (r.status, fname, size, text[:1500]))
+            raise RuntimeError("OSS %s: %s" % (r.status, text[:800]))
+        except OssPolicyError as e:
+            # 出错时把 policy 条件和实际表单贴出来，下次一眼看出是哪条不满足
+            log("OSS 策略拒收(不重试): %s" % str(e)[:2000])
+            raise
         except Exception as e:
             last = e
             _t.sleep(1 + i * 2)  # 指数退避
@@ -463,16 +557,21 @@ def main():
         ok, msg = do_share(token)
         log("%s 分享: %s" % ("OK" if ok else "FAIL", msg))
 
+    failed = False
     if not args.quick_only:
         # 发视频：从社区广场搬运别人视频→二次剪辑→发布（不删除，删了扣分）
         ok, msg = do_repost_videos(token)
         log("%s 发视频: %s" % ("OK" if ok else "FAIL", msg))
+        failed = not ok
 
     _, after = get_info(token)
     log("之前 %s → 现在 %s（变化 %+d）"
         % (before, after, int(after or 0) - int(before or 0)))
     log("任务状态: %s" % task_status(token))
     log("全部完成")
+    # 一条都没发出去就让这个 step 变红：否则 Actions 永远显示 ✅，失败静默
+    if failed and os.environ.get("CHERY_STRICT_EXIT", "1") != "0":
+        raise SystemExit("视频任务未成功，按 CHERY_STRICT_EXIT 退出码 1")
 
 
 if __name__ == "__main__":
