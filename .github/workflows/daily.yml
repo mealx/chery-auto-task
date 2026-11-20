@@ -9,8 +9,10 @@ on:
   workflow_dispatch:  # 允许手动点一下立即跑一次
 
 env:
-  BILI_KEYWORD: "奇瑞瑞虎8改装"
-  BILI_MAX: "6"
+  # 日志实时输出，不然所有 print 会挤在同一秒里，看不出真实耗时
+  PYTHONUNBUFFERED: "1"
+  # 视频一条都没发出去时让 step 变红（设 0 关闭）
+  CHERY_STRICT_EXIT: "1"
 
 jobs:
   daily:
@@ -24,18 +26,16 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install pycryptodome imageio-ffmpeg requests
+        run: pip install pycryptodome imageio-ffmpeg
 
       - name: Run sign-in and share
         env:
           CHERY_TOKEN: ${{ secrets.CHERY_TOKEN }}
         run: python src/daily.py --quick-only
 
-      - name: Download videos
-        run: python src/video_downloader.py --download-only
-
-      - name: Make daily videos
-        run: python src/video_maker.py
+      # 注：Download videos / Make daily videos 两步已移除。
+      # 搬运链路（do_repost_videos）是从社区广场扒视频，不读 videos/raw 与 videos/out，
+      # 那两步只是每天白等 2 分半并按 403/567 刷日志。video_downloader.py / video_maker.py 保留备用。
 
       - name: Run video tasks
         env:
