@@ -301,7 +301,9 @@ def oss_upload(token, mp4_bytes, suffix="mp4", tries=5):
             boundary = "----CheryB%s" % secrets.token_hex(4)
             fields = {"key": fname, "policy": sts["policy"],
                       "OSSAccessKeyId": sts["accessId"],
-                      "signature": sts["signature"]}
+                      "signature": sts["signature"],
+                      # 不带这个域时 OSS 默认回 204（成功但空 body），容易被误判成失败
+                      "success_action_status": "200"}
             # policy 里既有 eq $Content-Type 条件时，表单必须真的带这个字段，
             # 只写在 file part 的 header 里 OSS 不认（这正是一次 Policy Condition fail 的常见原因）
             fields["Content-Type"] = ctype
@@ -332,7 +334,7 @@ def oss_upload(token, mp4_bytes, suffix="mp4", tries=5):
             r = conn.getresponse()
             rb = r.read()
             conn.close()
-            if r.status == 200:
+            if 200 <= r.status < 300:  # 200/201/204 都算成功（204=没带 success_action_status 的默认回包）
                 return "https://img.chery.cn/" + fname
             text = rb.decode("utf-8", "replace")
             # 400/403 里的条件类错误是确定性的，重试只会白等 45 秒
